@@ -81,9 +81,10 @@ def main():
             current_datetime = datetime.now()
             Time = np.array([current_datetime.minute, current_datetime.second, (current_datetime.microsecond)//1000])
             # print('Time: {}' .format(Time.flatten()))
-            if file.tell() == 0:
-                file.write(f"Time; Q_a; q_u_no_load; Tip; Pose\n")
-            file.write(f"{Time.flatten()};{(q_a +5.0).flatten()}; {q_u_0.flatten()}; {(t_tip*1000).flatten()}; {R_tip.flatten()}\n")
+            
+            # if file.tell() == 0:
+            #     file.write(f"Time; Q_a; q_u_no_load; Tip; Pose\n")
+            # file.write(f"{Time.flatten()};{(q_a +5.0).flatten()}; {q_u_0.flatten()}; {(t_tip*1000).flatten()}; {R_tip.flatten()}\n")
 
         except KeyboardInterrupt:
             file.close()
