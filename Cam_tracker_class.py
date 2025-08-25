@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import time
 import os
+from pathlib import Path
 
 class Cam_Tracker:
     def __init__(self):
@@ -44,7 +45,8 @@ class Cam_Tracker:
         # print(marker_ref_0)
 
         # ===================== Load camera params ========================
-        self.params = [self.load_params(f'cam{i+1}.npz') for i in range(3)]
+        script_path =  Path(__file__).parent.resolve()
+        self.params = [self.load_params(f'{script_path}/cam{i+1}.npz') for i in range(3)]
 
         # ======================= Setup cameras =========================
         # caps = [cv2.VideoCapture(cam_id) for cam_id in VID_PATH] # Use to run tracker on videos
