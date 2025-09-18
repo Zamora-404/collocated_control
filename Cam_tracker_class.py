@@ -31,7 +31,7 @@ class Cam_Tracker:
         # mass_h = 6.75   # steel mass height (6.6g)
         ef_h = -6     # end effector height 
         # ef_h = 0
-        scale = 1.2     # marker vector scale factor
+        scale = 1.3     # marker vector scale factor
         self.marker_ref_b = np.array([
             [ 0.0   * scale, -6.729 * scale,    ef_h],  # red
             [-5.827 * scale, -3.265 * scale,    ef_h],  # yellow
@@ -77,13 +77,13 @@ class Cam_Tracker:
             upper = np.array([56, 255, 255])
             mask = cv2.inRange(hsv, lower, upper)
         elif n == 1:  # Blue
-            lower = np.array([100, 108, 70])
+            lower = np.array([100, 120, 80])
             upper = np.array([130, 255, 255])
             mask = cv2.inRange(hsv, lower, upper)
         else:  # Red (n==2)
-            lower_red1 = np.array([0, 50, 50])
-            upper_red1 = np.array([4, 255, 255])
-            lower_red2 = np.array([155, 50, 50])
+            lower_red1 = np.array([0, 80, 80])
+            upper_red1 = np.array([5, 255, 255])
+            lower_red2 = np.array([170, 80, 80])
             upper_red2 = np.array([179, 255, 255])
             mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
             mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
