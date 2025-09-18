@@ -44,7 +44,8 @@ class Cam_Tracker:
         # print(marker_ref_0)
 
         # ===================== Load camera params ========================
-        self.params = [self.load_params(f'cam{i+1}.npz') for i in range(3)]
+        self.path = os.path.dirname(os.path.abspath(__file__))
+        self.params = [self.load_params(f'{self.path}/cam{i+1}.npz') for i in range(3)]
 
         # ======================= Setup cameras =========================
         # caps = [cv2.VideoCapture(cam_id) for cam_id in VID_PATH] # Use to run tracker on videos
