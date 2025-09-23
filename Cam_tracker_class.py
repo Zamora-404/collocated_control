@@ -13,7 +13,7 @@ class Cam_Tracker:
 
         # ================ Marker Kinematics===============
         # Start Kinematics
-        base_mark_height = 0.012 # meters
+        base_mark_height = 0.012 
         # sba base frame wrt to global, eventually repplace with three marker reference
         self.T_base_0 = np.eye(4)
         R_b0 = np.array([[0, 0, 1],
@@ -26,7 +26,7 @@ class Cam_Tracker:
         self.T_base_0[0:3,3] = p_b0
         
         # mass_h = 6.75   # steel mass height (6.6g)
-        ef_h = -6     # end effector height 
+        ef_h = -9     # end effector height (w/o ball bearing 6mm)
         scale = 1.3     # marker vector scale factor
         self.marker_ryb_ref_b = np.array([
             [ 0.0   * scale, -6.729 * scale,    ef_h],  # red
@@ -368,8 +368,9 @@ def main():
     # try:
     while True:
         tracker.update()
-        pose = tracker.get_pose()
-        print("tip position:", pose[0]*1000)
+        p1, p2, p3, p4 = tracker.get_pose()
+        print(p1*1000, p2 )
+        # print("tip position:", pose[0]*1000)
     # except:
     #     print("error, closing tracker")
     #     tracker.close()
