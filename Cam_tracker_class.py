@@ -4,7 +4,7 @@ import time
 import os
 
 class Cam_Tracker:
-    def __init__(self, vizOn = False, captureFrame = False):
+    def __init__(self, vizOn = False, captureFrame = False, version = "alpha"):
         # ========================== Settings ========================
         CAM_IDS = [0, 2, 4] # Adjust as needed
         VID_PATH = ['output_cam0.avi','output_cam1.avi','output_cam2.avi',]
@@ -13,35 +13,43 @@ class Cam_Tracker:
         self.vizOn = vizOn
 
         # ================ Marker Kinematics===============
-        # Start Kinematics
-        # base height of marker
-        base_maker_z = 5
-        # sba base frame wrt to global, eventually repplace with three marker reference
-        self.T_base_0 = np.eye(4)
-        R_b0 = np.array([[0, 0, 1],
-                        [-1, 0, 0],
-                        [0, -1, 0]])
-        # R_b0 = np.eye(3)
         # Rotatin to align secondary marker to planar tangent z axis 
         R_wb = np.array([[1, 0, 0],
                         [0, 0, -1],
                         [0, 1, 0]])
-        # R_wb = np.eye(3)
 
-        # base frame from camera global frame obtained experimentaly 
-        # p_b0 = - np.array([0/1000, 0/1000, 0/1000]) # use when calibrating base frame
-        p_b0 = - np.array([147.21546  /1000, 9.82555 /1000, (-27.53051 - base_maker_z)/1000 ]) # use when calibrating base frame
-        # p_b0 = - np.array([142.14238/1000, 5.24423/1000, -25.10751/1000]) # for AL cage
-        
+        # sba base frame wrt to global, eventually repplace with three marker reference
+        if version.lower() == 'alpha':
+            # base height of marker
+            base_maker_z = 5    # marker height during calibration
+            ef_h = -9.5            # end effector height
 
+            R_b0 = np.array([[0, 0, 1],
+                            [-1, 0, 0],
+                            [0, -1, 0]])
+            p_b0 = - np.array([147.21546  /1000, 9.82555 /1000, (-27.53051 - base_maker_z)/1000 ]) # use when calibrating base frame
+        elif version.lower() == 'beta':
+            # base height of marker
+            base_maker_z = 8    # marker height during calibration
+            ef_h = -4.5            # (end effector height) ditance from SBA tip to effector tip
+
+            R_b0 = np.array([[ 0.03844, -0.99149,  0.12435],
+                                [-0.65426, -0.11904, -0.74685],
+                                [ 0.7553,  -0.05265, -0.65327]]).T
+
+            # p_b0 = - np.array([227.16415,  -22.79323, (-193.31263 - 0) ])/1000 # use when calibrating base frame
+            p_b0 = - np.array([228.2768,   -25.55244, -202.96172 - base_maker_z])/1000 # use when calibrating base frame
+            # p_b0 = - np.array([0/1000, 0/1000, 0/1000]) # use when calibrating base frame
+        else:
+            R_b0 = np.eye(3)
+            p_b0 = - np.array([0/1000, 0/1000, 0/1000]) # use when calibrating base frame
+
+        self.T_base_0 = np.eye(4)
         self.T_base_0[0:3,0:3] = R_b0
         self.T_base_0[0:3,3] = p_b0
-        
-        # mass_h = 6.75                         # steel mass height (6.6g)
-        # ef_h = 0            # use when calibrating base frame
-        ef_h = -9.5                           # end effector height (w/o ball bearing 6mm)
 
-        scale_1, scale_2, scale_3 = 1.4, 1.2, 1.2     # marker vector scale factor
+        # define marker transfomations
+        scale_1, scale_2, scale_3 = 1.3, 1.3, 1.3     # marker vector scale factor
         self.marker_ryb_ref_b = np.array([
             [ 0.0   * scale_1, -6.729 * scale_1,    ef_h],  # red
             [-5.827 * scale_2, -3.265 * scale_2,    ef_h],  # yellow
@@ -67,6 +75,7 @@ class Cam_Tracker:
         # white acrylic 
         # self.marker_pov_ref_b = (self.marker_pov_ref_b + np.array([13,6.5,15])/1000 )@ R_wb
 
+
         self.marker_ryb_ref_0 = self.marker_ryb_ref_b @ R_b0
         self.marker_pov_ref_0 = (self.marker_pov_ref_b) @ R_b0
 
@@ -81,7 +90,7 @@ class Cam_Tracker:
 
         # ===================== Load camera params ========================
         self.path = os.path.dirname(os.path.abspath(__file__))
-        self.params = [self.load_params(f'{self.path}/cam{i+1}.npz') for i in range(3)]
+        self.params = [self.load_params(f'{self.path}/stage_' + version + f'/cam{i+1}.npz') for i in range(3)]
 
         # ======================= Setup cameras =========================
         self.caps = [cv2.VideoCapture(cam_id) for cam_id in CAM_IDS]
@@ -112,8 +121,10 @@ class Cam_Tracker:
 
         # Create windows
         self.D_coeff = 5 # 18 to 24 worked well, best results at 24, kp = 0.4, kff = 1 @ 19 FPS
-        cv2.namedWindow("Trackbars")
-        cv2.createTrackbar("D_coeff", "Trackbars", self.D_coeff , 30, self.nothing)
+
+        if self.vizOn:
+            cv2.namedWindow("Trackbars")
+            cv2.createTrackbar("D_coeff", "Trackbars", self.D_coeff , 30, self.nothing)
         
         
 
@@ -417,8 +428,6 @@ class Cam_Tracker:
             # cv2.imshow(f"Camera 1", frames[0])
             for i, f in enumerate(frames):
                 cv2.imshow(f"Camera {i+1}", f)
-        
-        if True:
             self.D_coeff = cv2.getTrackbarPos("D_coeff", "Trackbars")
 
 
@@ -442,12 +451,15 @@ class Cam_Tracker:
         # T_p_b = T_w_b @ self.T_p_w
         # return (self.t_tip_b, self.R_tip_b, T_p_b[0:3,3], T_p_b[0:3,0:3])
         # return (self.t_tip_b *1000, self.R_tip_b, self.t_wall_b*1000, self.R_wall_b)
-        return (self.t_tip_b *1000, self.R_tip_b, self.t_wall_b*1000, self.R_wall_b, self.D_coeff)
+        if self.vizOn:
+            return (self.t_tip_b *1000, self.R_tip_b, self.t_wall_b*1000, self.R_wall_b, self.D_coeff)
+        
+        return (self.t_tip_b *1000, self.R_tip_b, self.t_wall_b*1000, self.R_wall_b)
 
 
 def main():
-    np.set_printoptions(precision=5, suppress=True)
-    tracker = Cam_Tracker(vizOn=True, captureFrame=False)
+    np.set_printoptions(precision=3, suppress=True)
+    tracker = Cam_Tracker(vizOn=True, captureFrame=False, version ="beta")
 
     # # Initialize time
     time_start = time.time()
@@ -469,7 +481,9 @@ def main():
         p1, R1, p2, R4, D = state[0], state[1], state[2], state[3], state[4]/10000
 
 
-        print(p1, p2, D)
+        # print(p1, p2, D)
+        print(p1)
+        print(R1)
         # print(p3, p4 )
         # print(p1, p3 )
         # print("tip position:", pose[0]*1000)
