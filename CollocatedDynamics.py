@@ -19,7 +19,7 @@ from q_optimization import Q_Optimize
 
 #Initializing variables
 
-n = 1           # number of segments
+n = 3           # number of segments
 i_goal = 0
 arduino = []
 sensor = []
@@ -41,10 +41,10 @@ u_volumes = np.array([0,0,0])
 class CollocatedDynamics:
     def __init__(self, u_init):
 
-        self.n    = 1                   #Number of segments for the SBA
+        self.n    = 3                   #Number of segments for the SBA
         self.d    = 4.75                #Geometric parameter chamber radial distance
         self.gain = 1                   #Gain for the U_ell
-        self.r    = 7
+        self.r    = 9.5                  # rigid offset from sensor (7mm w/o ball bearing)
         self.K = np.diag([15,15,.5]*self.n)
         self.D = np.diag([5,5,5]*self.n)
         self.I = np.diag((self.K.diagonal()**2)/(4*self.D.diagonal()))
@@ -53,6 +53,7 @@ class CollocatedDynamics:
         self.base_length = 5
 
         self.tip_prev = np.array([0,0,self.base_length])
+        self.goal_prev = np.array([0,0,0])
         self.time_now = time.time()
         self.time_prev = self.time_now - 0.05
 
@@ -64,8 +65,35 @@ class CollocatedDynamics:
         self.q_f_prev = np.array([0,0,0]*self.n)
 
         self.opt = Q_Optimize()
+
+        self.b = 0
+        self.alpha = 0.0003
+        self.k = 5
+
+        self.sigma = 0
+
+
+        self.Efi = 0
+        self.kf = 80
+        self.kv = 0.1
+        self.ki = 0
+        self.kp = 2
+
+        self.v_f_prev = 0
+
+        self.error_f_integral = 0
+
+        self.hasReachedGoal = False
+        self.hasRechedStart = False
+        self.T_0 = 0 # start time for the path
+
+        self.f_des_prev = .1
         
         # print(self.q_a_prev,  self.q_u_prev )
+
+        self.K_u = np.eye(3*self.n )
+        self.D_u = np.eye(3*self.n )
+        
 
 
     def volume_to_length(self, v1, v2, v3):
@@ -202,6 +230,33 @@ class CollocatedDynamics:
                 Jxi[:, k] = np.cross(z[0:3,k], (p_tip - p[:,k]))
 
         return Jxi
+    
+    def Compute_Full__Augmented_Jacobian(self, dh_aug):
+        # This function allows us to evaluate the Jacobian for the RRPRR model. The jacobian size is
+        # 3 x 5*n, (here n is number of segments and 5 basically is the number of joints per segment
+        # in our case we have 5 joints per segment)
+        N = 5*self.n
+        T = np.eye(4)
+        p = np.zeros((3, N+1))
+        z = np.tile(np.array([[0.],[0.],[1.]]), (1 , N+1))
+        new_dh_aug = dh_aug
+        new_dh_aug[-1,1] = self.r
+        for k in range(N):
+            theta, d, a, alpha = new_dh_aug[k]
+            T     = T@self.DH_transform(theta,d,a,alpha)
+            p[:, k+1] = T[0:3, 3]
+            z[:, k+1] = T[0:3, 2]
+        p_tip = p[:, -1]
+        Jxi   = np.zeros((6, N))
+        for k in range(N):
+            idx = k%5
+            if idx == 2:
+                Jxi[:3,k] = z[0:3, k]
+                Jxi[3:,k] = np.array([[0.],[0.],[0.]]).ravel()
+            else:
+                Jxi[:3, k] = np.cross(z[0:3,k], (p_tip - p[:,k]))
+                Jxi[3:, k] = z[0:3,k]
+        return Jxi
 
     def ComputeJacobian(self, q):
         global r
@@ -211,7 +266,15 @@ class CollocatedDynamics:
         _, Jm  = self.Build_XI(q)
 
         J_q    = Jxi @ Jm
+    
 
+        return J_q
+    
+    def ComputeFullJacobian(self, q):
+        dh_aug = self.Augmented_DH(q)
+        Jxi = self.Compute_Full__Augmented_Jacobian(dh_aug)
+        _, Jm = self.Build_XI(q)
+        J_q = Jxi @ Jm
         return J_q
 
     def q_diff(self, q1, q2):
@@ -228,64 +291,6 @@ class CollocatedDynamics:
 
         return diff_q
 
-    def Model(self, t, q, f_ext_fun, q_ref, Ei_prev):
-        # Our basic dynamic model K(q - q_ref) + Dq_dot = J^T.F_ext
-
-        K = self.K
-        D = self.D
-        I = self.I
-        J  = self.ComputeJacobian(q)
-        f  = f_ext_fun(t)
-        diff_q_q_ref = self.q_diff(q, q_ref)
-
-        Residual = J.T.dot(f) - K.dot(diff_q_q_ref) - I.dot(Ei_prev)
-        dq = np.linalg.solve(D, Residual)
-        return dq
-
-    def new_Model(self, t, q, f_ext_fun,q_ref, q_ref_dot,Ei_prev):
-        # Our basic dynamic model Kq + D(q_dot - q_ref_dot) = J^T.F_ext
-        K = self.K
-        D = self.D
-        I = self.I
-        J  = self.ComputeJacobian(q)
-        f  = f_ext_fun(t)
-        diff_q_q_ref = self.q_diff(q, q_ref)
-
-        Residual = J.T.dot(f) - K.dot(diff_q_q_ref) - I.dot(Ei_prev)
-        dq = q_ref_dot + np.linalg.solve(D, Residual)
-        return dq
-
-    def q_dynamics(self, q0, Ei_prev, f_ext_fun, t0, dt):
-        # Function to evaluate the configuration variable (q) at t = t + dt under the action of
-        # external force acting at the tip
-        q0 = np.asarray(q0).reshape(-1)
-        t_span = (t0, t0 + dt)
-
-        sol = solve_ivp(fun = lambda t, q: self.Model(t, q, f_ext_fun, q0, Ei_prev),
-                        t_span = t_span,
-                        y0 = q0,
-                        method= 'RK45',
-                        t_eval = [t0 + dt])
-
-        q_next = sol.y[:,-1]
-
-        return q_next.reshape(-1,1)
-
-    def q_dynamics_new(self, q_init, q_ref, q_ref_dot, Ei_prev, f_ext_fun, t0, dt):
-        # Function to evaluate the configuration variable (q) at t = t + dt under the action of
-        # external force acting at the tip
-        q_init = np.asarray(q_init).reshape(-1)
-        t_span = (t0, t0 + dt)
-
-        sol = solve_ivp(fun = lambda t, q: self.new_Model(t, q, f_ext_fun, q_ref, q_ref_dot, Ei_prev),
-                        t_span = t_span,
-                        y0 = q_init,
-                        method= 'RK45',
-                        t_eval = [t0 + dt])
-
-        q_next = sol.y[:,-1]
-
-        return q_next.reshape(-1,1)
 
     def q_no_load(self, ell):
         # Function to evaluate the q under no load from the given Ells
@@ -310,28 +315,6 @@ class CollocatedDynamics:
 
 
 
-        # if np.isclose(ell_1, ell_2, atol = 0.05) and np.isclose(ell_2, ell_3, tol = 0.05) and np.isclose(ell_1, ell_3, atol = 0.05):
-        #     theta = 0.1
-        #     phi      = phi % (2*math.pi)
-        #     prev_phi = prev_phi % (2*math.pi)
-
-        #     eps = 0.01  # small tolerance for “near 0” or “near π”
-        #     if abs(prev_phi) < eps and abs(phi - math.pi) < eps:
-        #         hi = prev_phi
-        #     elif abs(prev_phi - math.pi) < eps and abs(phi) < eps:
-        #         phi = prev_phi
-        #     else:
-        #         # 3) compute minimal signed difference in (−π, π]
-        #         diff = ((phi - prev_phi + math.pi) % (2*math.pi)) - math.pi
-
-        #         # 4) if jump > 45° (0.785 rad), nudge by ±0.08 rad
-        #         if abs(diff) > 0.785:
-        #             phi = prev_phi + (0.08 if diff > 0 else -0.08)
-        #             # re‐normalize if needed
-        #             phi = phi % (2*math.pi)
-
-
-
         for i in range(self.n):
             idx = i*3
             q_0[idx] = phi
@@ -341,7 +324,7 @@ class CollocatedDynamics:
         return q_0
 
     def Compute_Jacobian_Ell_Q(self, q):
-        # Function to evaluate the jacobian relating change in Ell w.r.t change in q
+        # Function to evaluate the jacobian relating change in Ell (q_a) w.r.t change in q_u
         q = np.asarray(q).reshape(-1)
         J = np.zeros((3,3*self.n))
         def Compute_d_Ell(q,d,i,j):
@@ -367,14 +350,14 @@ class CollocatedDynamics:
 
     def Actuated_Jacobian(self, q):
         # Final actuated Jacobian equating change in tip_coordinates based on changes in Ell
-        J_rq = self.ComputeJacobian(q)
-        J_Eq = self.Compute_Jacobian_Ell_Q(q)
+        J_rq = self.ComputeJacobian(q) # J_q = del_x/del_qu
+        J_Eq = self.Compute_Jacobian_Ell_Q(q) # J_au = del_q_a/del_q_u
 
         J_Eq_inv = np.linalg.pinv(J_Eq)
 
         J_a = J_rq @ J_Eq_inv
 
-        return J_a
+        return J_a, J_rq
 
 
 
@@ -422,7 +405,7 @@ class CollocatedDynamics:
 
     def Compute_Soft_Curve (self, q):
         q = np.asarray(q).reshape(-1)
-        samples = 100
+        samples = 5
         T = np.eye(4)
         softPts = np.zeros((3, samples*self.n))
         skelPts = np.zeros((3, self.n + 1))
@@ -500,7 +483,7 @@ class CollocatedDynamics:
         Solves the ODE for q_a using the equation:
         M_a * ddq_a + D_a * dq_a + K_a * q_a = A_a * u
         """
-        M_a, C_a, D_a, K_a, A_a = self.actuated_dynamics_matrices(q_a_prev, volumes)
+        M_a, C_a, D_a, K_a, A_a = self.actuated_dynamics_matrices(q_a_prev, d_q_a_prev, volumes)
     
 
         # Define dynamics as first-order system
@@ -524,49 +507,37 @@ class CollocatedDynamics:
         
         return q_a, d_q_a
     
-    def compute_q_a_dynamics_no_mass(self, volumes, q_a_prev, d_q_a_prev, dt):
-        """
-        Solves the ODE for q_a using the equation:
-        M_a * ddq_a + D_a * dq_a + K_a * q_a = A_a * u
-        """
-        M_a, C_a, D_a, K_a, A_a = self.actuated_dynamics_matrices(q_a_prev, volumes)
-        
 
-        d_q_a = np.linalg.inv( D_a ) @ (A_a @ volumes - K_a @ q_a_prev) # solve kiento-satics problem with damp
+    def Matrix_inverse(self, J):
+        U, S, Vh = np.linalg.svd(J, full_matrices = False)
+        V = Vh.T
+        sigma_0 = 0.01*max(S)
+        nu = 50
+        h = (S**3 +nu*S**2 + 2*S + 2*sigma_0)/(S**2 + nu*S + 2)
+        H_inv = np.diag(1.0/h)
+        J_inv = V @ H_inv @ U.T
 
-        
-        q_a = q_a_prev + d_q_a
-        
-        return q_a, d_q_a
+        return J_inv
 
-    # def compute_q_u_dynamics(self, q_a, F_ext, q_f_prev, dt, T_tip = np.eye(4)): 
-    #     q_u_0 = self.q_no_load(q_a + self.base_length)         # Compute no load underacttuated vars
-    #     J_u  = self.ComputeJacobian(q_u_0)  # compute underact jacobian (shape) as function of actuated coordinates (no load condition, CC jacobian from feedforward shape estimation)
-        
-        
-    #     M_u, C_u, D_u, K_u = self.underactuated_dynamics_matrices(q_a) # compute the dynamics matrices for the system inflate to state q_a
-        
-    #     # print(q_f_prev, K_u)
-    #     joint_torques = J_u.T @ F_ext # compute joint torques using underact jacobian 
-    #     elastic_torques = K_u @ q_f_prev 
+    def task_stiffness(self, J, K_u):
+        K_u_inv = self.Matrix_inverse(K_u)
+        K_c_inv = J @ K_u_inv @ J.T
 
-    #     q_f = np.linalg.inv(K_u)@ (joint_torques)
-    #     q_u = q_u_0 + q_f
+        # K_c = self.Matrix_inverse(K_c_inv)
 
-    #     # print("joint torques:", joint_torques)
+        return K_c_inv
 
-    #     # q_u_star = self.opt.solver(q_u, self.Compute_tip_pose, T_tip)
-    #     # print(q_u)
-    #     # print(q_u_star)
     
-    #     return q_u, q_f, q_u_0
     
     def compute_q_u_dynamics_2(self, q_a, F_ext, q_f_prev, dt, T_tip = np.eye(4)): 
         # print(self.q_u_0_prev)
         # q_u_0 = self.q_u_0_prev
         q_u_0 = self.q_no_load(q_a + self.base_length)         # Compute no load underacttuated vars
         J_u  = self.ComputeJacobian(q_u_0)  # compute underact jacobian (shape) as function of actuated coordinates (no load condition, CC jacobian from feedforward shape estimation)
+        # J_u = self.ComputeFullJacobian(q_u_0)
         M_u, C_u, D_u, K_u = self.underactuated_dynamics_matrices(q_a) # compute the dynamics matrices for the system inflate to state q_a
+        
+        # print('Joint_forces: {}' .format(J_u.T @ F_ext))
         
         q_f = np.linalg.inv(K_u + D_u/dt) @ (J_u.T @ F_ext + D_u @ q_f_prev / dt) 
         q_u = q_u_0 + q_f
@@ -584,9 +555,12 @@ class CollocatedDynamics:
         # K_u = np.diag([.02, .04, 1, .02, .3, 1 ,.02, .3, 1]) * np.mean(q_a + self.base_length)/40
 
         # K_u = np.diag([.25*self.n, 0.8333*self.n, 0.3333*self.n] * self.n)
-        K_u = np.diag([.2*self.n, 0.8333*self.n, 0.3333*self.n] * self.n)
+        K_u = np.diag([.25*self.n, .8*self.n, 0.33*self.n] * self.n)
         # K_u = np.diag([.75, 2.5, 1]*self.n)  
         D_u = K_u / 20
+
+        self.K_u = K_u
+        self.D_u = D_u
         
         return M_u, C_u, D_u, K_u,
 
@@ -602,12 +576,19 @@ class CollocatedDynamics:
         return M
 
 
-    def actuated_dynamics_matrices(self, q_a, u_vol):
+    def actuated_dynamics_matrices(self, q_a, d_q_a, u_vol):
         # Set to be diagonal approximations or fit from data
         M_a = self.compute_mass_matrix(q_a, u_vol)  # mass/inertia matrix - set dependent to volume in chamber
         C_a = np.zeros((3, 3))                 # Coriolis- assumed negligible
-        D_a = np.diag([0.001, 0.001, 0.001])         # Damping - found experimetally by best fit
-        K_a = np.diag([0.02, 0.02, 0.02])      # stiffness - set from linear fit between u_vol (mL) and ell (mm)
+        # D_a = np.diag([0.0008, 0.0008, 0.0008])         # Damping - found experimetally by best fit
+        # D_a = np.diag([0.006]*3)
+        # D_a = np.diag([0.00012]*3)
+        # D_a = np.diag([0.0012]*3)
+        D_a = np.diag([0.0014]*3)
+        # D_a = np.diag([ 0.002 if d_q >= 0 else 0.003 for d_q in d_q_a])
+
+
+        K_a = np.diag([0.022, 0.022, 0.022])      # stiffness - set from linear fit between u_vol (mL) and ell (mm)
         A_a = np.eye(3)                        # input matrix - set to eye as defined by collocated control
         
         return M_a, C_a, D_a, K_a, A_a
@@ -615,7 +596,7 @@ class CollocatedDynamics:
 
     def compute_control_dynamics(self, q_a, d_q_a, q_a_des, d_q_a_des, d_d_q_a_des, u_vol):
         # Get dynamics matrices from current configuartion 
-        M_a, C_a, D_a, K_a, A_a = self.actuated_dynamics_matrices(q_a, u_vol)
+        M_a, C_a, D_a, K_a, A_a = self.actuated_dynamics_matrices(q_a, d_q_a, u_vol)
         # print(M_a)
         # print(d_d_q_a_des)
 
@@ -626,18 +607,268 @@ class CollocatedDynamics:
             M_a @ d_d_q_a_des + C_a @ d_q_a_des + D_a @ d_q_a_des + K_a @ q_a_des
         )
         return v_cmd
+    
 
-    def inverse_kinematics(self, error, tip_vel, q_a, q_u):
+    def inverse_kinematics_force_2(self, error, tip_vel, goal_vel, q_a, q_u, R_wall, F_tip, F_des,dt):
         ''' Compute q_a desired to reach goal_coords from current tip_coords using
             the current robot shape for jacobian estimation'''
-        J_a = self.Actuated_Jacobian(q_u)
-        J_a_dag = np.linalg.pinv(J_a)
-        del_q_a = .4* J_a_dag @ error + .00*J_a_dag @ (-tip_vel)
+        
+        normal_vec = -R_wall[:,2]
+        F_tip = -F_tip
+        f_des_vel = (np.linalg.norm( F_des ) - self.f_des_prev)/dt
+        self.f_des_prev = np.linalg.norm( F_des )
+
+    
+        normal_basis     = np.outer(normal_vec, normal_vec)
+        tangential_basis = np.eye(3) - normal_basis 
+
+        e_t = tangential_basis@error       #tangential error
+        e_n = float(normal_vec@ error)     #normal_error (scalar)
+
+
+        J_a, J_u = self.Actuated_Jacobian(q_u)       #|  Actuated Jacobian and its inverse
+        J_ac_inv = self.Matrix_inverse(J_a)  #|
+
+    
+
+        #normal direction control
+        # f_ext = float(normal_vec @ F_tip)
+        # if self.sigma > 0.7:
+        #     self.Efi = self.Efi + error_f*dt
+
+        f_ext = np.linalg.norm(F_tip)
+        error_f  = F_des - f_ext
+        
+
+        speed_tip = float(normal_vec @ tip_vel)
+        speed_wall_n = normal_vec @ goal_vel
+        speed_wall_t = tangential_basis @ goal_vel
+
+
+        # using global vars
+        # v_f = self.kf * error_f 
+        # v_n = self.kp*e_n     
+
+        # testing local vars for dynamic case
+        # v_f = 400 * error_f + 2.5*speed_wall_n
+        # v_n = 2 * e_n       + 2.5*speed_wall_n
+        # for static sinusoidal force
+        # v_f = 150 * error_f + 200*f_des_vel
+        # v_n = 2 * e_n       + 0*speed_wall_n
+
+        # testing dynanic finger
+        # v_f = 200 * error_f + .5*speed_wall_n
+        # v_n = 1 * e_n       + .5*speed_wall_n
+
+        # if f_ext <= 0.02 and abs(normal_vec.T @ tip_vel) < 0.1:
+        #     self.b = (1 - self.alpha)*self.b + self.alpha * f_ext
+         
+        
+
+        # print('F_tip: {}' .format(F_tip))
+        # print('f_ext: {}' .format(f_ext))
+        # print('error_f: {}' .format(error_f))
+        # print('e_n: {}' .format(e_n))
+        # print('e_t: {}' .format(e_t))
+        # print('v_n: {}' .format(v_n))
+        # print('v_f: {}' .format(v_f))
+        # print('normal: {}' .format(normal_vec))
+        # print('sigma: {}' .format(self.sigma))
+
+        M = .0006
+        B =  0.0033
+
+        #Admittance Control
+        v_f = self.v_f_prev + (1/M)*dt*(error_f - B*self.v_f_prev)
+        self.v_f_prev = v_f
+
+        print(self.v_f_prev)
+
+        #normal position control
+        v_n = 2 * e_n
+
+
+        # print('R_wall: {}' .format(R_wall))
+        F  = e_n
+        Fc = .7
+        
+        self.sigma = 1 / (1 + math.exp(-10 * (Fc - F)))
+
+
+        # calc normal force vec using sigmoid to transition between admittance and pos error
+        V_n = normal_vec*((1 - self.sigma)*v_n + self.sigma*v_f)      #final normal direction control
+
+
+        #tangential direction control
+        V_t = 1*e_t + 0*speed_wall_t
+
+        #desired control
+        V_des = (1 - self.sigma)*V_t + V_n + 2*goal_vel
+
+        V_des = V_des.flatten()
+
+        #control inputs
+        q_a_dot = J_ac_inv @ V_des
+        del_q_a = dt*q_a_dot
         q_a_des = q_a + del_q_a
-        return q_a_des, del_q_a
+
+        # print("vdes:", V_des)
+
+
+        # return q_a_des, del_q_a, np.array([self.sigma, 0, e_n])
+        return q_a_des, del_q_a, error
+    
     
 
 
+    def inverse_kinematics_force_on_path(self, error, tip_vel, goal_vel, q_a, q_u, R_wall, F_tip, F_des, dt):
+        ''' Compute q_a desired to reach goal_coords from current tip_coords using
+            the current robot shape for jacobian estimation'''
+        
+
+        """Notice that I am overriding F_des here"""
+        F_des = 0.1
+
+
+        normal_vec = -R_wall[:,2]
+        F_tip = -F_tip
+    
+        normal_basis     = np.outer(normal_vec, normal_vec)
+        tangential_basis = np.eye(3) - normal_basis 
+
+        e_t = tangential_basis@error       #tangential error
+        e_n = float(normal_vec@ error)     #normal_error (scalar)
+
+
+        J_a, J_u = self.Actuated_Jacobian(q_u)       #|  Actuated Jacobian and its inverse
+        J_ac_inv = self.Matrix_inverse(J_a)  #|
+
+
+        #normal direction control
+        # f_ext = float(normal_vec @ F_tip)
+        f_ext = np.linalg.norm(F_tip)
+        error_f  = F_des - f_ext
+
+
+        # speed_tip = float(normal_vec @ tip_vel)
+        goal_vel_n = normal_vec @ goal_vel
+        goal_vel_t = tangential_basis @ goal_vel
+
+        # testing local vars
+        # v_f = 200 * error_f + 0.*speed_wall_n
+        # v_n = 2 * e_n       + 0.*speed_wall_n
+        
+        v_f = 10 * error_f 
+        v_n = 2 * e_n       
+
+
+        # calc sigma value from error
+        e_now  = e_n
+        e_set = 0.5
+        self.sigma = 1 / (1 + math.exp(-10 * (e_set - e_now)))
+        # self.sigma = 0
+
+
+        V_n = normal_vec*((1 - self.sigma)*v_n + self.sigma*v_f)      #final normal direction control
+
+
+        #tangential direction control
+        # V_t = 3*e_t + 1*speed_wall_t
+        V_t = 7*e_t 
+        #desired control
+        V_des = V_t + V_n + 2* goal_vel
+        # V_des = (1 - self.sigma)*V_t + V_n
+
+
+        #control inputs
+        q_a_dot = J_ac_inv @ V_des
+        del_q_a = dt*q_a_dot
+        q_a_des = q_a + del_q_a
+
+        # print("vdes:", V_des)
+
+
+        return q_a_des, del_q_a, np.array([self.sigma, 0, 0])
+        # return q_a_des, del_q_a, error
+
+    # This is Leo's function
+    # def inverse_kinematics_force(self, tip_coords, tip_vel, goal_coords, goal_vel, q_a, q_u, F_mes, F_des, t_wall, R_wall):
+    #     ''' Compute q_a desired to reach goal_coords from current tip_coords using
+    #         the current robot shape for jacobian estimation'''
+    #     J_a = self.Actuated_Jacobian(q_u)
+    #     J_a_dag = np.linalg.pinv(J_a)
+    #     J_u = self.ComputeJacobian(q_u)
+    #     _,_,_,K_u = self.underactuated_dynamics_matrices(q_a)
+    #     K_c_inv = self.task_stiffness(J_u, K_u)
+
+    #     # 1) Plane normal unit vector
+    #     n = R_wall[:,2]
+
+    #     # 2) Tangential unit vector
+    #     P_t = np.eye(3) - np.outer(n, n)
+        
+    #     # 2) normal force measured and desired
+    #     f_n_mes = n @ F_mes
+    #     f_n_des = F_des
+
+    #     # 3) Normal position
+    #     x_n = n @ tip_coords
+    #     v_n = n @ tip_vel
+    #     # x_n_des = x_n + (f_n_mes - f_n_des) / (n @ K_c_inv)
+    #     v_n_des = n @ goal_vel
+
+    #     # 4) Tangent pos and vel
+    #     x_t = P_t @ tip_coords
+    #     v_t = P_t @ tip_vel
+    #     x_t_des = P_t @ goal_coords
+    #     v_t_des = P_t @ goal_vel
+
+    #     # 5) normal velocity command
+    #     v_n_cmd = 1 * (f_n_mes - f_n_des)
+    #     # v_n = 0.1 * (x_n_des - x_n) - 0.1 * v_n
+
+    #     # 6) tangent velocity command
+    #     e_t = (x_t_des - x_t)
+    #     v_t_cmd = 1 * e_t
+
+    #     # print("n:", n)
+    #     print("P_t:", P_t)
+    #     # print("v_n:", v_n)
+    #     print("v_t:", v_t)
+    #     # print("f_n_des:", f_n_des)
+    #     # print("f_n_mes:", f_n_mes, flush=True)
+
+    #     # 7) joint velocities del_q_a
+    #     # del_q_a =  4*J_a_dag @ (n * v_n_cmd) + 0.1*J_a_dag @ (n * v_n_des) + 0.2*J_a_dag @ v_t_cmd + 0.1*J_a_dag @ (v_t_des)
+    #     del_q_a =  4*J_a_dag @ (n * v_n_cmd) + 0.2*J_a_dag @ v_t_cmd 
+
+
+    #     # del_q_a = .065* J_a_dag @ K_c_inv @(- F_des + F_tip) 
+    #     # del_q_a = .2* J_a_dag @(- F_des + F_mes) + .01* J_a_dag @ error 
+        
+    #     q_a_des = q_a + del_q_a
+
+    #     return q_a_des, del_q_a, e_t
+    
+    # def inverse_kinematics_force(self, error, tip_vel, q_a, q_u, F_tip, F_des):
+    #     ''' Compute q_a desired to reach goal_coords from current tip_coords using
+    #         the current robot shape for jacobian estimation'''
+    #     J_a = self.Actuated_Jacobian(q_u)
+    #     J_a_dag = np.linalg.pinv(J_a)
+
+    #     J_u = self.ComputeJacobian(q_u)
+
+    #     _,_,_,K_u = self.underactuated_dynamics_matrices(q_a)
+
+    #     K_c_inv = self.task_stiffness(J_u, K_u)
+
+
+    #     # del_q_a = .065* J_a_dag @ K_c_inv @(- F_des + F_tip) 
+    #     del_q_a = .3* J_a_dag @(- F_des + F_tip) + .01* J_a_dag @ error 
+    #     q_a_des = q_a + del_q_a
+
+    #     return q_a_des, del_q_a
+    
 
     def generate_circle(self, radius, z_height, num_points=100):
         """ Generate points for a circle parallel to xy plane"""
@@ -655,7 +886,157 @@ class CollocatedDynamics:
         
         return circleCoords
     
-    def CLIK(self, robot_data, tip_coords, R_tip, force, path_coords):
+    def inverse_kinematics_force(self, error, tip_vel, goal_vel, q_a, q_u, R_wall, F_tip, F_des, f_des_vel, dt):
+        ''' Compute q_a desired to reach goal_coords from current tip_coords using
+            the current robot shape for jacobian estimation'''
+        
+        # dt = 1/33
+        
+        normal_vec = -R_wall[:,2]
+        F_tip = -F_tip
+        # f_des_vel = (np.linalg.norm( F_des ) - self.f_des_prev)/dt
+        # self.f_des_prev = np.linalg.norm( F_des )
+
+    
+        normal_basis     = np.outer(normal_vec, normal_vec)
+        tangential_basis = np.eye(3) - normal_basis 
+
+        e_t = tangential_basis@error       #tangential error
+        e_n = float(normal_vec@ error)     #normal_error (scalar)
+
+
+        J_a, J_u = self.Actuated_Jacobian(q_u)       #|  Actuated Jacobian and its inverse
+        J_ac_inv = self.Matrix_inverse(J_a)  #|
+        # J_ac_inv = np.linalg.pinv(J_a) # test if this more efficient than above eqtn
+        J_u_inv = np.linalg.pinv(J_u)
+
+        # K_c = J_u @ self.K_u @ J_u.T
+        # K_n = normal_vec @ K_c
+
+        K_c = J_u_inv.T @ self.K_u @ J_u_inv
+        K_n = np.linalg.norm( normal_vec @ K_c )
+
+        print("K_n:", K_n)
+        # print(K_c, flush=True)
+    
+
+        # print("shape J_a:", np.shape(J_a))
+        # print("shape J_u:", np.shape(J_u))
+        # print("shape K_c:", np.shape(K_c))
+        print("",flush=True)
+    
+
+        #normal direction control
+        # f_ext = float(normal_vec @ F_tip)
+        # if self.sigma > 0.7:
+        #     self.Efi = self.Efi + error_f*dt
+
+        f_ext = np.linalg.norm(F_tip)
+        error_f  = F_des - f_ext
+        
+        self.error_f_integral = self.error_f_integral + error_f*dt
+
+
+        
+
+        speed_tip = float(normal_vec @ tip_vel)
+        speed_wall_n = normal_vec @ goal_vel
+        speed_wall_t = tangential_basis @ goal_vel
+
+
+        tip_vel_n = normal_vec @ tip_vel
+
+        # testing local vars for dynamic case
+        # v_f = .6 * 1/K_n * error_f/dt  + 4 * speed_wall_n 
+        # v_f =   2 * 1/K_n * (error_f) /dt  + 3 * speed_wall_n 
+        # v_n =   0.3* e_n / dt               + 3 * speed_wall_n
+
+
+        # v_f =   0.98 * 1/K_n * (error_f) /dt   + 5.0* speed_wall_n 
+        # v_n =   0.2 * e_n / dt               + 5* speed_wall_n 
+
+
+        # # for static force
+        v_f = .3 * 1/K_n*error_f/dt + 0.05 * 1/K_n * f_des_vel  #+ 0*0.098*self.error_f_integral
+        v_n = 0.2 * e_n / dt       + 0 * 0.1* 1/K_n * f_des_vel
+        V_t = 0.2 *e_t / dt + 0*speed_wall_t
+
+        # # for dynamic force
+        # v_f = .3 * 1/K_n*error_f/dt + 0.05 * 1/K_n * f_des_vel  #+ 0*0.098*self.error_f_integral
+        # v_n = 0.2 * e_n / dt       + 0 * 0.1* 1/K_n * f_des_vel
+        # V_t = 0.2 *e_t / dt + 0*speed_wall_t
+
+
+        # testing dynanic finger
+        # v_f = 200 * error_f + .5*speed_wall_n
+        # v_n = 1 * e_n       + .5*speed_wall_n
+        
+
+
+        #tangential direction control
+        # V_t =   0.2 *e_t / dt + 5*speed_wall_t
+
+
+        # print('F_tip: {}' .format(F_tip))
+        # print('f_ext: {}' .format(f_ext))
+        # print('error_f: {}' .format(error_f))
+        # print('e_n: {}' .format(e_n))
+        # print('e_t: {}' .format(e_t))
+        # print('v_n: {}' .format(v_n))
+        # print('v_f: {}' .format(v_f))
+        # print('normal: {}' .format(normal_vec))
+        # print('sigma: {}' .format(self.sigma))
+
+        # print('R_wall: {}' .format(R_wall))
+        F  = e_n
+        Fc = 1
+        
+        self.sigma = 1 / (1 + math.exp(-13*(Fc - F)))
+
+        print('sigma: {}' .format(self.sigma))
+
+
+        # calc normal force vec using sigmoid to transition between admittance and pos error
+        V_n = normal_vec*((1 - self.sigma)*v_n + self.sigma*v_f -(1 - 0.5*self.sigma)*0.12*tip_vel_n)       #final normal direction control
+
+
+        #desired control
+        V_des = (1 - self.sigma)*V_t + V_n 
+        # V_des = (1 - self.sigma)*V_t + V_n - (1-self.sigma)*0.1*tip_vel
+
+        # V_des = V_t + V_n
+
+        V_des = V_des.flatten()
+
+        #control inputs
+        q_a_dot = 1.0*J_ac_inv @ V_des
+        del_q_a = dt*q_a_dot
+        q_a_des = q_a + del_q_a
+
+        # print("vdes:", V_des)
+
+
+        # return q_a_des, del_q_a, np.array([self.sigma, 0, e_n])
+        return q_a_des, del_q_a, np.array([error_f,0,0])
+    
+    def inverse_kinematics(self, error, goal_vel, q_a, q_u):
+        ''' Compute q_a desired to reach goal_coords from current tip_coords using
+            the current robot shape for jacobian estimation'''
+        J_a, J_u = self.Actuated_Jacobian(q_u)
+        J_a_dag = np.linalg.pinv(J_a)
+
+        # error :   2.88    2.51    
+        # ff    :   .1      .15     
+        if self.hasRechedStart:
+            del_q_a = 0.6* J_a_dag @ error + 1*.1*J_a_dag @ (goal_vel)
+            
+        else:
+            del_q_a = .1* J_a_dag @ error + 0*.1*J_a_dag @ (goal_vel)
+
+        q_a_des = q_a + del_q_a
+        return q_a_des, del_q_a
+    
+    def CLIK(self, robot_data, tip_coords, R_tip, t_wall, R_wall, force, path_coords, period):
         ''' M_a @ d_d_q_a + D_a @ d_q_a + K_a @ q_a = A @ u
         
             where 
@@ -676,12 +1057,52 @@ class CollocatedDynamics:
         self.time_prev = time_now
         
         # get system vars in order
-        goal_coords = path_coords[:, self.i_goal]
+        # goal_coords = t_wall
+        
+        # goal_vel = (goal_coords - self.goal_prev) / dt
+        # self.goal_prev = goal_coords
+
+        # goal_coords = path_coords[:, self.i_goal]
+
+        if np.linalg.norm(tip_coords - np.array([0,0,29])) < 0.6 and not self.hasRechedStart:
+            self.hasRechedStart = True
+            print("==========STARTED PATH==========")
+            self.T_0 = time_now
+            
+
+        if self.hasRechedStart:
+            goal_coords = np.array([5*np.sin(2*np.pi*(time_now - self.T_0) / (period/2) ),
+                                    10*np.sin(2*np.pi*(time_now - self.T_0) / period),
+                                    25 + 4*np.cos(2*np.pi*(time_now - self.T_0) / (period/2) )])
+            
+            goal_vel = np.array([2*np.pi/ (period/2)    *  5*np.cos(2*np.pi*(time_now - self.T_0) / (period/2) ),
+                                2*np.pi/ period         *  10*np.cos(2*np.pi*(time_now - self.T_0) / period),
+                                -2*np.pi/ (period/2)    *  4*np.sin(2*np.pi*(time_now - self.T_0) / (period/2) )])
+        
+        else:
+            goal_coords = np.array([0,0,29])
+            goal_vel = np.array([0,0,0])
+        
+        
+
+        
 
         # 0. Collect force data and system data
-        F_tip = -R_tip @ force  # transform to get force acting on tip in global frame
-        F_tip = np.array([0,0,0])
-        print(F_tip)
+        # F_tip = -R_tip @ force  # transform to get force acting on tip in global frame
+        F_tip = force
+        f_n_des = 0.12
+        f_des_vel = 0
+
+        P = 10
+        # f_n_des = 0.08 + 0.04*np.sin(2*np.pi*time_now/ P )
+        # f_des_vel = 2*np.pi/ P  * 0.04*np.cos(2*np.pi*time_now/ P )
+        
+
+
+        # F_des = R_wall @ np.array( [0,0,f_n_des])
+        F_des = np.array( [0,0,f_n_des] )
+
+        
 
         pressures = np.array(robot_data[:3])
         volumes = np.array(robot_data[3:6])/1000 # convert from
@@ -702,17 +1123,23 @@ class CollocatedDynamics:
 
         # TODO: compute IK for q_a
         # 2.a Compute Inverse kinematics to solve for desired actuated config vars q_a_des
-
         error = goal_coords - tip_coords
         tip_vel = (tip_coords - self.tip_prev) / dt
         self.tip_prev = tip_coords
         u_volumes = volumes.copy()
         
+        # e_t = np.zeros(3)
+        # e_t = error
         q_a_des, d_q_a_des, d_d_q_a_des = np.array([0,0,0]), np.array([0,0,0]), np.array([0,0,0])
 
+        # 2.b given current shape, def by q_a and q_u, find the q_a_des to minimize tip error
 
-        # given current shape, def by q_a and q_u, find the q_a_des to minimize tip error
-        q_a_des, d_q_a_des = self.inverse_kinematics(error, tip_vel, q_a, q_u) 
+        # This is shresth function
+        q_a_des, d_q_a_des = self.inverse_kinematics(error, goal_vel, q_a, q_u)
+        # q_a_des, d_q_a_des, e_t = self.inverse_kinematics_force(error, tip_vel, goal_vel, q_a, q_u, R_wall, F_tip, f_n_des, f_des_vel, dt)
+        # q_a_des, d_q_a_des, e_t = self.inverse_kinematics_force_2(error, tip_vel, goal_vel, q_a, q_u, R_wall, F_tip, f_n_des, dt)
+        # q_a_des, d_q_a_des, e_t = self.inverse_kinematics_force_on_path(error, tip_vel, goal_vel, q_a, q_u, R_wall, F_tip, f_n_des, dt)
+
 
         # 3.a Compute inverse dynamics
         u_volumes = self.compute_control_dynamics(q_a, d_q_a, q_a_des, d_q_a_des, d_d_q_a_des, volumes)
@@ -722,12 +1149,15 @@ class CollocatedDynamics:
         
 
 
-        if np.linalg.norm(error) < 1:
-            self.i_goal = (self.i_goal + 1) % num_points
-            print("goal reached at:", goal_coords)
+        # if np.linalg.norm(error) < 1:
+        #     self.i_goal = (self.i_goal + 1) % num_points
+        #     print("goal reached at:", goal_coords)
+        #     print("Tip position", tip_coords)
 
+        
+        # return u_volumes, commands, backbone_pred, rigid_pred, tip_pred, dt, q_a, q_u_0, F_des, e_t, goal_coords
+        return u_volumes, commands, backbone_pred, rigid_pred, tip_pred, dt, q_a, q_u_0, F_des, error, goal_coords
 
-        return u_volumes, commands, backbone_pred, rigid_pred, tip_pred, dt, q_a, q_u_0 
 
 
 
